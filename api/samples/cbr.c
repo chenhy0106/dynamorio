@@ -60,6 +60,9 @@
 
 #include "dr_api.h"
 #include "drmgr.h"
+#if defined(AARCHXX) || defined(RISCV64)
+#    include "drreg.h"
+#endif
 
 #define MINSERT instrlist_meta_preinsert
 
@@ -80,6 +83,11 @@
 
 /* Possible cbr states */
 typedef enum { CBR_NEITHER = 0x00, CBR_TAKEN = 0x01, CBR_NOT_TAKEN = 0x10 } cbr_state_t;
+
+#if defined(AARCHXX) || defined(RISCV64)
+drvector_t allowed_scratch; /* stolen register should not be reserved as scratch reg */
+reg_id_t dr_reg_stolen;
+#endif
 
 /* Each bucket in the hash table is a list of the following elements.
  * For each cbr, we store its address and its state.
@@ -334,6 +342,41 @@ event_app_instruction(void *drcontext, void *tag, instrlist_t *bb, instr_t *inst
         app_pc fall = (app_pc)decode_next_pc(drcontext, (byte *)src);
         app_pc targ = instr_get_branch_target_pc(instr);
 
+#if defined(AARCHXX) || defined(RISCV64)
+        /* For ARM and RISCV, if instr uses the stolen regs, we have to replace it with a
+         * scratch reg here, because instr will be set meta and can not be mangled later.
+         * We can not use drreg_get_app_value() as DR will refuse to load into the same
+         * reg returned by dr_get_stolen_reg(). See comment in drreg_get_app_value().
+         */
+        if (instr_uses_reg(instr, dr_reg_stolen)) {
+            reg_id_t scratch_reg;
+            if (drreg_reserve_register(drcontext, bb, instr, &allowed_scratch,
+                                       &scratch_reg) != DRREG_SUCCESS) {
+                DR_ASSERT(false); /* cannot recover */
+                return DR_EMIT_DEFAULT;
+            }
+
+            dr_insert_get_stolen_reg_value(drcontext, bb, instr, scratch_reg);
+
+            for (int i = 0; i < instr_num_srcs(instr); i++) {
+                opnd_t src_opnd = instr_get_src(instr, i);
+                if (opnd_is_reg(src_opnd) && opnd_get_reg(src_opnd) == dr_reg_stolen) {
+                    opnd_replace_reg(&src_opnd, dr_reg_stolen, scratch_reg);
+                    instr_set_src(instr, i, src_opnd);
+                }
+            }
+
+            dr_insert_set_stolen_reg_value(drcontext, bb, instr_get_next(instr),
+                                           scratch_reg);
+
+            if (drreg_unreserve_register(drcontext, bb, instr_get_next(instr),
+                                         scratch_reg) != DRREG_SUCCESS) {
+                DR_ASSERT(false);
+                return DR_EMIT_DEFAULT;
+            }
+        }
+#endif
+
         /* Redirect the existing cbr to jump to a callout for
          * the 'taken' case.  We'll insert a 'not-taken'
          * callout at the fallthrough address.
@@ -341,7 +384,7 @@ event_app_instruction(void *drcontext, void *tag, instrlist_t *bb, instr_t *inst
         instr_t *label = INSTR_CREATE_label(drcontext);
         /* should be meta, and meta-instrs shouldn't have translations */
         instr_set_meta_no_translation(instr);
-        /* it may not reach (in particular for x64) w/ our added clean call */
+        /* it may not reach w/ our added clean call */
         if (instr_is_cti_short(instr)) {
             /* if jecxz/loop we want to set the target of the long-taken
              * so set instr to the return value
@@ -374,7 +417,8 @@ event_app_instruction(void *drcontext, void *tag, instrlist_t *bb, instr_t *inst
          * well as Linux.
          */
         instrlist_preinsert(
-            bb, NULL, INSTR_XL8(INSTR_CREATE_jmp(drcontext, opnd_create_pc(fall)), fall));
+            bb, NULL,
+            INSTR_XL8(XINST_CREATE_jump(drcontext, opnd_create_pc(fall)), fall));
 
         /* label goes before the 'taken' callout */
         MINSERT(bb, NULL, label);
@@ -392,7 +436,8 @@ event_app_instruction(void *drcontext, void *tag, instrlist_t *bb, instr_t *inst
          * block (this should not be a meta-instruction).
          */
         instrlist_preinsert(
-            bb, NULL, INSTR_XL8(INSTR_CREATE_jmp(drcontext, opnd_create_pc(targ)), targ));
+            bb, NULL,
+            INSTR_XL8(XINST_CREATE_jump(drcontext, opnd_create_pc(targ)), targ));
     }
     /* since our added instrumentation is not constant, we ask to store
      * translations now
@@ -428,6 +473,7 @@ dr_exit(void)
 #endif
 
     delete_table(global_table);
+    drvector_delete(&allowed_scratch);
     drmgr_exit();
 }
 
@@ -440,6 +486,13 @@ dr_client_main(client_id_t id, int argc, const char *argv[])
         DR_ASSERT_MSG(false, "drmgr_init failed!");
 
     global_table = new_table();
+
+#if defined(AARCHXX) || defined(RISCV64)
+    drreg_init_and_fill_vector(&allowed_scratch, true);
+    dr_reg_stolen = dr_get_stolen_reg();
+    drreg_set_vector_entry(&allowed_scratch, dr_reg_stolen, false);
+#endif
+
     if (!drmgr_register_bb_instrumentation_event(NULL, event_app_instruction, NULL))
         DR_ASSERT_MSG(false, "fail to register event_app_instruction!");
     dr_register_exit_event(dr_exit);
